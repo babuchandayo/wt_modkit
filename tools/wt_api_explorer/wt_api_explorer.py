@@ -34,12 +34,21 @@ def run_cli(args):
 
 
 def run_gui(args):
+    import queue
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
+    # tkinter はメインスレッド以外から触ると固まることがあるため、
+    # 通信は作業スレッドだけが行い、結果はキュー経由でメインスレッドへ渡す。
     c = Collector(args.url, endpoints=DEFAULT_ENDPOINTS + args.extra)
-    lock = threading.Lock()
+    lock = threading.Lock()          # Collector を触るのは作業スレッドと保存処理だけ
     running = threading.Event()
+    wake = threading.Event()         # 「1回取得」や開始時にすぐ取得させる
+    clear_req = threading.Event()
+    results: queue.Queue = queue.Queue()
+    settings = {"url": args.url, "extra": list(args.extra), "interval": args.interval}
+    busy = {"polling": False}
+    snapshot = {"rows": [], "statuses": [], "polls": 0}
 
     root = tk.Tk()
     root.title("War Thunder ローカルAPI 値一覧")
@@ -58,8 +67,10 @@ def run_gui(args):
     ttk.Entry(top, textvariable=extra_var, width=20).pack(side="left", padx=4)
     start_btn = ttk.Button(top, text="開始")
     start_btn.pack(side="left", padx=2)
-    ttk.Button(top, text="1回取得", command=lambda: threading.Thread(target=poll, daemon=True).start()).pack(side="left", padx=2)
-    ttk.Button(top, text="クリア", command=lambda: (lock.acquire(), c.clear(), lock.release(), refresh())).pack(side="left", padx=2)
+    once_btn = ttk.Button(top, text="1回取得")
+    once_btn.pack(side="left", padx=2)
+    clear_btn = ttk.Button(top, text="クリア")
+    clear_btn.pack(side="left", padx=2)
     ttk.Button(top, text="CSV保存", command=lambda: save("csv")).pack(side="left", padx=2)
     ttk.Button(top, text="JSON保存", command=lambda: save("json")).pack(side="left", padx=2)
 
@@ -90,29 +101,47 @@ def run_gui(args):
     tree.pack(side="left", fill="both", expand=True)
     sb.pack(side="right", fill="y")
 
-    def apply_settings():
-        c.base_url = url_var.get().strip().rstrip("/")
-        c.endpoints = DEFAULT_ENDPOINTS + [p if p.startswith("/") else "/" + p for p in extra_var.get().split()]
+    def read_settings():
+        # メインスレッドで画面の値を読み、作業スレッド用の dict に写す
+        settings["url"] = url_var.get().strip().rstrip("/")
+        settings["extra"] = [p if p.startswith("/") else "/" + p for p in extra_var.get().split()]
+        try:
+            settings["interval"] = max(0.2, float(interval_var.get()))
+        except ValueError:
+            settings["interval"] = 1.0
 
-    def poll():
-        with lock:
-            apply_settings()
-            c.poll_once()
-        root.after(0, refresh)
+    def worker():
+        while True:
+            wake.wait(timeout=settings["interval"] if running.is_set() else None)
+            wake.clear()
+            if not running.is_set() and not once_flag.is_set():
+                continue
+            once_flag.clear()
+            busy["polling"] = True
+            results.put(None)  # 「取得中」表示のため
+            with lock:
+                if clear_req.is_set():
+                    c.clear()
+                    clear_req.clear()
+                c.base_url = settings["url"]
+                c.endpoints = DEFAULT_ENDPOINTS + settings["extra"]
+                c.poll_once()
+                snap = {"rows": list(c.rows()), "statuses": list(c.status.values()), "polls": c.polls}
+            busy["polling"] = False
+            results.put(snap)
 
-    def refresh():
-        with lock:
-            rows = list(c.rows())
-            statuses = list(c.status.values())
-            polls = c.polls
+    once_flag = threading.Event()
+    threading.Thread(target=worker, daemon=True).start()
+
+    def redraw():
         ep_tree.delete(*ep_tree.get_children())
-        for s in statuses:
+        for s in snapshot["statuses"]:
             ep_tree.insert("", "end", text=s.endpoint,
                            values=("OK" if s.ok else "NG", s.content_type, s.size, s.error))
         q = filter_var.get().lower()
         tree.delete(*tree.get_children())
         shown = 0
-        for r in rows:
+        for r in snapshot["rows"]:
             if q and q not in (r["endpoint"] + " " + r["key"]).lower():
                 continue
             v = r["last_value"]
@@ -120,30 +149,65 @@ def run_gui(args):
                                            v if len(v) < 300 else v[:300] + "…",
                                            r["min"], r["max"], r["seen_count"]))
             shown += 1
-        status_var.set(f"{'取得中' if running.is_set() else '停止中'}  取得回数 {polls}  キー {len(rows)} (表示 {shown})")
+        update_status(shown)
 
-    filter_var.trace_add("write", lambda *_: refresh())
+    def update_status(shown=None):
+        if shown is None:
+            shown = len(tree.get_children())
+        state = "取得中" if running.is_set() else "停止中"
+        if busy["polling"]:
+            state += "（通信中…）"
+        ok = sum(1 for s in snapshot["statuses"] if s.ok)
+        status_var.set(f"{state}  取得回数 {snapshot['polls']}  応答あり {ok}/{len(snapshot['statuses'])}"
+                       f"  キー {len(snapshot['rows'])} (表示 {shown})")
 
-    def loop():
-        while running.is_set():
-            poll()
-            try:
-                iv = max(0.2, float(interval_var.get()))
-            except ValueError:
-                iv = 1.0
-            time.sleep(iv)
+    def pump():
+        got = None
+        try:
+            while True:
+                item = results.get_nowait()
+                if item is not None:
+                    got = item
+        except queue.Empty:
+            pass
+        if got is not None:
+            snapshot.update(got)
+            redraw()
+        else:
+            update_status()
+        root.after(200, pump)
+
+    filter_var.trace_add("write", lambda *_: redraw())
 
     def toggle():
+        read_settings()
         if running.is_set():
             running.clear()
             start_btn.config(text="開始")
         else:
             running.set()
             start_btn.config(text="停止")
-            threading.Thread(target=loop, daemon=True).start()
-        refresh()
+            wake.set()
+        update_status()
+
+    def once():
+        read_settings()
+        once_flag.set()
+        wake.set()
+
+    def clear():
+        clear_req.set()
+        snapshot.update({"rows": [], "statuses": [], "polls": 0})
+        redraw()
+        if not lock.locked():
+            with lock:
+                if clear_req.is_set():
+                    c.clear()
+                    clear_req.clear()
 
     start_btn.config(command=toggle)
+    once_btn.config(command=once)
+    clear_btn.config(command=clear)
 
     def save(kind):
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -152,11 +216,18 @@ def run_gui(args):
                                             filetypes=[(kind.upper(), "*." + kind)])
         if not path:
             return
-        with lock:
+        # 通信中でも待たない: 取得が終わるまで最大数秒待ち、だめなら知らせる
+        if not lock.acquire(timeout=5):
+            messagebox.showwarning("保存", "通信中のため保存できませんでした。もう一度押してください。")
+            return
+        try:
             (c.save_csv if kind == "csv" else c.save_json)(path)
+        finally:
+            lock.release()
         messagebox.showinfo("保存", f"保存しました:\n{path}")
 
-    refresh()
+    redraw()
+    root.after(200, pump)
     root.mainloop()
     running.clear()
 

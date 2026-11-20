@@ -10,6 +10,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 # 既知のエンドポイント。存在・中身はゲームのバージョンや状態(格納庫/戦闘中/機種)で変わる。
@@ -137,8 +138,10 @@ class Collector:
     def poll_once(self) -> None:
         now = time.time()
         self.polls += 1
-        for ep in self.endpoints:
-            st = self.fetch(ep)
+        # 並列に取得する（ゲーム未起動時、Windowsでは接続拒否に1回2秒ほどかかるため）
+        with ThreadPoolExecutor(max_workers=len(self.endpoints) or 1) as ex:
+            fetched = list(ex.map(self.fetch, self.endpoints))
+        for ep, st in zip(self.endpoints, fetched):
             self.status[ep] = st
             if st.last_raw is None:
                 continue
