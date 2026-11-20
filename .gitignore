@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+wt_api_keys_*.csv
+wt_api_dump_*.json
